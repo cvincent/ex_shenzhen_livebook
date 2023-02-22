@@ -1,0 +1,617 @@
+# Shenzhen I/O Solitaire
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.8.1"}
+])
+```
+
+## Introduction
+
+This Livebook contains a simple implementation of the solitaire-like game from Zachtronics's Shenzhen I/O. The in-game instructions are shown below:
+
+<!-- livebook:{"break_markdown":true} -->
+
+![](images/Screenshot_3.png)
+
+<!-- livebook:{"break_markdown":true} -->
+
+A few important details aren't described in the above screenshot:
+
+* Each of three colors has a corresponding suit of 4 "dragons", represented by the color and a symbol.
+* A dragon cannot stack or be stacked upon. It can only be moved into an empty cell, or all 4 consolidated at once into an available free cell as described.
+* There is also a single "flower" card, which can always immediately be moved into the single designated flower cell. It has no real impact on the game, but brings the deck to a nice, even length of 40 cards, for a neat opening game of 8 columns of 5 cards each.
+
+## Cards
+
+This module defines a simple `Card` struct and a convenient function for constructing a deck.
+
+```elixir
+defmodule Card do
+  defstruct color: nil, ordinal: nil
+
+  @type color :: :black | :green | :red | nil
+  @type ordinal :: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | :dragon | :flower
+  @type t :: %Card{color: color(), ordinal: ordinal()}
+
+  @colors [:black, :green, :red]
+
+  def deck() do
+    Enum.concat([
+      numbers(),
+      # TODO: There's a better way to do this
+      dragons(),
+      dragons(),
+      dragons(),
+      dragons(),
+      [flower()]
+    ])
+  end
+
+  def numbers() do
+    @colors
+    |> Enum.map(&numbers/1)
+    |> Enum.concat()
+  end
+
+  def numbers(color) do
+    1..9
+    |> Enum.map(fn i -> %__MODULE__{color: color, ordinal: i} end)
+  end
+
+  def dragons() do
+    @colors
+    |> Enum.map(fn c -> %__MODULE__{color: c, ordinal: :dragon} end)
+  end
+
+  def flower() do
+    %__MODULE__{color: nil, ordinal: :flower}
+  end
+end
+```
+
+## Board
+
+This module defines the state of a game in the form of a `Board` struct. It also defines functions for modifying the game state with moves (either validated or not) and consolidating dragons (if possible).
+
+```elixir
+defmodule Board do
+  defstruct free_slots: {[], [], []},
+            flower: [],
+            black: [],
+            green: [],
+            red: [],
+            stacks: {[], [], [], [], [], [], [], []}
+
+  @type t :: %Board{
+          free_slots: {list(Card), list(Card), list(Card)},
+          flower: list(Card),
+          black: list(Card),
+          green: list(Card),
+          red: list(Card),
+          stacks: {
+            list(Card),
+            list(Card),
+            list(Card),
+            list(Card),
+            list(Card),
+            list(Card),
+            list(Card),
+            list(Card)
+          }
+        }
+
+  @type location :: %{
+          zone: :free_slots | :flower | :black | :green | :red | :stacks,
+          index: nil | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7,
+          count: non_neg_integer()
+        }
+
+  @type move :: %{from: location(), to: location()}
+
+  def new_game() do
+    deck = Card.deck() |> Enum.shuffle()
+    # TODO: It's random so it doesn't matter,
+    # but this isn't quite how the original game deals the cards for a new game.
+    # Could probably use put_to/2 to do this
+    %Board{stacks: Enum.chunk_every(deck, 5) |> List.to_tuple()}
+  end
+
+  def move(board, move) do
+    {board, cards} = take_from(board, move.from)
+    put_to(board, move.to, cards)
+  end
+
+  def validate_and_move(board, move) do
+    if move.to in (Move.valid_locations_from(board, move.from) |> IO.inspect()) do
+      move(board, move)
+    else
+      board
+    end
+  end
+
+  def consolidate_dragons(board, color) do
+    find_dragons = fn zone ->
+      Map.get(board, zone)
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.filter(fn {stack, _i} -> length(stack) > 0 end)
+      |> Enum.map(fn {stack, i} -> {List.first(stack), zone, i} end)
+      |> Enum.filter(fn {card, _zone, _i} -> card.ordinal == :dragon and card.color == color end)
+    end
+
+    visible_dragons =
+      Enum.concat(
+        find_dragons.(:free_slots),
+        find_dragons.(:stacks)
+      )
+      |> IO.inspect()
+
+    dest_slot =
+      board.free_slots
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.find(fn {stack, _i} ->
+        card = List.first(stack)
+        length(stack) == 0 or (card.ordinal == :dragon and card.color == color)
+      end)
+
+    if length(visible_dragons) == 4 and is_tuple(dest_slot) do
+      {_, dest_slot} = dest_slot
+
+      {_, board} =
+        Enum.map_reduce(visible_dragons, board, fn {_, zone, i}, acc ->
+          {
+            nil,
+            Board.move(acc, %{
+              from: %{zone: zone, index: i, count: 1},
+              to: %{zone: :free_slots, index: dest_slot, count: 0}
+            })
+          }
+        end)
+
+      board
+    else
+      board
+    end
+  end
+
+  def get_stack(board, location) do
+    case location.zone do
+      zone when zone in [:free_slots, :stacks] ->
+        Map.get(board, zone)
+        |> elem(location.index)
+
+      zone ->
+        Map.get(board, zone)
+    end
+  end
+
+  def get_cards(board, location) do
+    get_stack(board, location)
+    |> Enum.take(location.count)
+  end
+
+  defp take_from(board, location) do
+    stack = get_stack(board, location)
+    cards = get_cards(board, location)
+    stack = Enum.drop(stack, location.count)
+    board = set_stack(board, location, stack)
+
+    {board, cards}
+  end
+
+  defp put_to(board, location, cards) do
+    stack = get_stack(board, location)
+    stack = Enum.concat(cards, stack)
+    set_stack(board, location, stack)
+  end
+
+  defp set_stack(board, location, stack) do
+    case location.zone do
+      zone when zone in [:free_slots, :stacks] ->
+        Map.put(
+          board,
+          zone,
+          Map.get(board, zone)
+          |> put_elem(location.index, stack)
+        )
+
+      zone ->
+        Map.put(board, zone, stack)
+    end
+  end
+end
+
+board = Board.new_game()
+
+board |> Kino.Tree.new()
+```
+
+## Display
+
+A simple bit of Kino for displaying the game board within Livebook.
+
+```elixir
+defmodule DisplayStack do
+  use Kino.JS
+
+  def new([]) do
+    Kino.JS.new(__MODULE__, ~s[<pre style="font-size: 20pt; text-align: center">▯</pre>])
+  end
+
+  def new(stack) do
+    cards =
+      stack
+      |> Enum.reverse()
+      |> Enum.map(fn card ->
+        ordinal =
+          case card.ordinal do
+            i when is_integer(i) -> i
+            :dragon -> "D"
+            :flower -> "F"
+          end
+
+        ~s[<b style="color: #{card.color}">#{ordinal}</b>]
+      end)
+      |> Enum.join("\n")
+
+    Kino.JS.new(__MODULE__, ~s[<pre style="font-size: 20pt; text-align: center">#{cards}</pre>])
+  end
+
+  asset("main.js", do: "export function init(ctx, html) { ctx.root.innerHTML = html; }")
+end
+
+defmodule DisplayBoard do
+  use Kino.JS
+
+  def new(board) do
+    top =
+      Enum.concat([
+        Tuple.to_list(board.free_slots),
+        [board.flower],
+        [board.black],
+        [board.green],
+        [board.red],
+        []
+      ])
+      |> Enum.map(&DisplayStack.new/1)
+      |> Kino.Layout.grid(columns: 8)
+
+    stacks =
+      board.stacks
+      |> Tuple.to_list()
+      |> Enum.map(&DisplayStack.new/1)
+      |> Kino.Layout.grid(columns: 8)
+
+    Kino.Layout.grid([top, stacks])
+  end
+
+  asset("main.js", do: "export function init(ctx, html) { ctx.root.innerHTML = html; }")
+end
+
+DisplayBoard.new(board)
+```
+
+## Test board
+
+Here we define a starting game manually for further testing, starting with a few unvalidated moves.
+
+```elixir
+board = %Board{
+  free_slots: {[], [], []},
+  flower: [],
+  black: [],
+  green: [],
+  red: [],
+  stacks:
+    {[
+       %Card{color: nil, ordinal: :flower},
+       %Card{color: :black, ordinal: 5},
+       %Card{color: :black, ordinal: 1},
+       %Card{color: :red, ordinal: 7},
+       %Card{color: :green, ordinal: :dragon}
+     ],
+     [
+       %Card{color: :black, ordinal: 8},
+       %Card{color: :red, ordinal: :dragon},
+       %Card{color: :green, ordinal: 6},
+       %Card{color: :green, ordinal: :dragon},
+       %Card{color: :black, ordinal: 6}
+     ],
+     [
+       %Card{color: :black, ordinal: :dragon},
+       %Card{color: :red, ordinal: 2},
+       %Card{color: :green, ordinal: 2},
+       %Card{color: :green, ordinal: :dragon},
+       %Card{color: :red, ordinal: :dragon}
+     ],
+     [
+       %Card{color: :black, ordinal: 9},
+       %Card{color: :green, ordinal: 1},
+       %Card{color: :black, ordinal: :dragon},
+       %Card{color: :black, ordinal: :dragon},
+       %Card{color: :black, ordinal: 3}
+     ],
+     [
+       %Card{color: :red, ordinal: 5},
+       %Card{color: :green, ordinal: 4},
+       %Card{color: :green, ordinal: 3},
+       %Card{color: :black, ordinal: 7},
+       %Card{color: :green, ordinal: :dragon}
+     ],
+     [
+       %Card{color: :red, ordinal: :dragon},
+       %Card{color: :green, ordinal: 7},
+       %Card{color: :green, ordinal: 8},
+       %Card{color: :red, ordinal: 6},
+       %Card{color: :green, ordinal: 5}
+     ],
+     [
+       %Card{color: :black, ordinal: 4},
+       %Card{color: :black, ordinal: 2},
+       %Card{color: :red, ordinal: 4},
+       %Card{color: :red, ordinal: 1},
+       %Card{color: :red, ordinal: 9}
+     ],
+     [
+       %Card{color: :red, ordinal: :dragon},
+       %Card{color: :black, ordinal: :dragon},
+       %Card{color: :red, ordinal: 8},
+       %Card{color: :red, ordinal: 3},
+       %Card{color: :green, ordinal: 9}
+     ]}
+}
+
+board =
+  board
+  |> Board.move(%{
+    from: %{zone: :stacks, index: 0, count: 2},
+    to: %{zone: :stacks, index: 2}
+  })
+
+DisplayBoard.new(board)
+```
+
+```elixir
+board =
+  board
+  |> Board.move(%{
+    from: %{zone: :stacks, index: 2, count: 1},
+    to: %{zone: :free_slots, index: 1}
+  })
+
+DisplayBoard.new(board)
+```
+
+## Move validation
+
+This module defines the real meat of the game logic. Given a location on the board, we can get back a list of every valid move from that location. We take this approach because it gives us a great starting point for writing a solver later.
+
+Consolidating dragons is currently handled in the `Board` module, since it consists of multiple moves and is either valid or not based on the entire game state. That said, it should probably be validated separately here, for easy use by the solver later.
+
+```elixir
+defmodule Move do
+  @movable_from ~w[free_slots stacks]a
+
+  def valid_locations_from(board, %{zone: zone, count: 1} = location)
+      when zone in @movable_from do
+    empty_free_slot_moves =
+      board.free_slots
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.filter(fn {slot, _i} -> length(slot) == 0 end)
+      |> Enum.map(fn {_, i} -> %{zone: :free_slots, index: i, count: 0} end)
+
+    card =
+      Board.get_cards(board, location)
+      |> List.first()
+
+    flower_move =
+      case card.ordinal do
+        :flower ->
+          [%{zone: :flower, index: 0, count: 0}]
+
+        _ ->
+          []
+      end
+
+    color_move =
+      case card.ordinal do
+        i when is_integer(i) ->
+          location = %{zone: card.color, index: 0, count: 0}
+          stack = Map.get(board, card.color)
+
+          cond do
+            length(stack) == 0 and card.ordinal == 1 ->
+              [location]
+
+            length(stack) > 0 and List.first(stack).ordinal == card.ordinal - 1 ->
+              [location]
+
+            true ->
+              []
+          end
+
+        _ ->
+          []
+      end
+
+    stack_moves =
+      board.stacks
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.map(fn {_stack, i} -> %{zone: :stacks, index: i, count: 0} end)
+      |> Enum.filter(fn location -> can_stack?(board, location, [card]) end)
+
+    Enum.concat([
+      empty_free_slot_moves,
+      flower_move,
+      color_move,
+      stack_moves
+    ])
+  end
+
+  def valid_locations_from(board, %{zone: zone} = location) when zone in @movable_from do
+    cards = Board.get_cards(board, location)
+
+    board.stacks
+    |> Tuple.to_list()
+    |> Enum.with_index()
+    |> Enum.map(fn {_stack, i} -> %{zone: :stacks, index: i, count: 0} end)
+    |> Enum.filter(fn location -> can_stack?(board, location, cards) end)
+  end
+
+  def valid_locations_from(_, _) do
+    []
+  end
+
+  def valid_sequence?([]), do: true
+
+  def valid_sequence?([_]), do: true
+
+  def valid_sequence?([first, second | tail])
+      when is_integer(first.ordinal) and is_integer(second.ordinal) and
+             first.color != second.color do
+    if first.ordinal == second.ordinal - 1 do
+      valid_sequence?([second | tail])
+    else
+      false
+    end
+  end
+
+  def valid_sequence?(_) do
+    false
+  end
+
+  def can_stack?(board, %{zone: :stacks} = location, cards) when length(cards) > 0 do
+    stack_bottom_card =
+      Board.get_stack(board, location)
+      |> List.first()
+
+    with true <- valid_sequence?(cards),
+         true <- valid_sequence?(Enum.concat(cards, [stack_bottom_card])) do
+      true
+    else
+      _ ->
+        false
+    end
+  end
+
+  def can_stack?(_, _, _) do
+    false
+  end
+end
+```
+
+## More testing
+
+And now we're just taking the game state we set up previously and trying a bunch of tests.
+
+```elixir
+DisplayBoard.new(board)
+```
+
+```elixir
+board =
+  board
+  |> Board.validate_and_move(%{
+    from: %{zone: :stacks, index: 6, count: 1},
+    to: %{zone: :stacks, index: 4, count: 0}
+  })
+
+DisplayBoard.new(board)
+```
+
+```elixir
+board =
+  board
+  |> Board.validate_and_move(%{
+    from: %{zone: :stacks, index: 0, count: 1},
+    to: %{zone: :black, index: 0, count: 0}
+  })
+
+DisplayBoard.new(board)
+```
+
+```elixir
+board =
+  board
+  |> Board.validate_and_move(%{
+    from: %{zone: :stacks, index: 6, count: 1},
+    to: %{zone: :black, index: 0, count: 0}
+  })
+
+DisplayBoard.new(board)
+```
+
+```elixir
+board =
+  board
+  |> Board.validate_and_move(%{
+    from: %{zone: :stacks, index: 6, count: 1},
+    to: %{zone: :stacks, index: 2, count: 0}
+  })
+
+DisplayBoard.new(board)
+```
+
+```elixir
+board =
+  board
+  |> Board.validate_and_move(%{
+    from: %{zone: :stacks, index: 6, count: 1},
+    to: %{zone: :red, index: 0, count: 0}
+  })
+
+DisplayBoard.new(board)
+```
+
+```elixir
+board =
+  board
+  |> Board.validate_and_move(%{
+    from: %{zone: :stacks, index: 0, count: 1},
+    to: %{zone: :stacks, index: 1, count: 0}
+  })
+
+DisplayBoard.new(board)
+```
+
+```elixir
+board =
+  board
+  |> Board.validate_and_move(%{
+    from: %{zone: :stacks, index: 1, count: 2},
+    to: %{zone: :stacks, index: 6, count: 0}
+  })
+
+DisplayBoard.new(board)
+```
+
+```elixir
+board =
+  board
+  |> Board.move(%{
+    from: %{zone: :stacks, index: 2, count: 6},
+    to: %{zone: :stacks, index: 0, count: 0}
+  })
+
+DisplayBoard.new(board)
+```
+
+```elixir
+board =
+  board
+  |> Board.validate_and_move(%{
+    from: %{zone: :stacks, index: 2, count: 1},
+    to: %{zone: :free_slots, index: 0, count: 0}
+  })
+
+DisplayBoard.new(board)
+```
+
+```elixir
+board = Board.consolidate_dragons(board, :red)
+DisplayBoard.new(board)
+```
