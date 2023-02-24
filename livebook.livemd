@@ -884,9 +884,9 @@ defmodule Solver do
         Enum.any?([:black, :green, :red], &Move.can_consolidate_dragons?(to_board, &1))
 
     # delta_empty_free_slots +
-    # delta_empty_stack_slots +
     score =
-      delta_win_position_cards * 4 +
+      delta_empty_stack_slots +
+        delta_win_position_cards * 4 +
         delta_exposed_next_needed * 2 -
         delta_exposed_dragon_colors
 
@@ -1075,9 +1075,39 @@ render_events = fn frame, button, solver_pid, recur ->
     {:new_board, board, previous_moves, next_moves} ->
       layout =
         [
-          previous_moves |> Enum.map(fn {move, _, _} -> move end),
+          previous_moves
+          |> Enum.map(fn {move, _, score} ->
+            %{
+              from: move.from.zone,
+              index: move.from.index,
+              count: move.from.count,
+              to: move.to.zone,
+              to_index: move.to.index,
+              score: score
+            }
+          end)
+          |> Kino.DataTable.new(
+            name: "Previous moves",
+            sorting_enabled: false,
+            keys: ~w[from index count to to_index score]a
+          ),
           DisplayBoard.new(board),
           next_moves
+          |> Enum.map(fn {move, score} ->
+            %{
+              from: move.from.zone,
+              index: move.from.index,
+              count: move.from.count,
+              to: move.to.zone,
+              to_index: move.to.index,
+              score: score
+            }
+          end)
+          |> Kino.DataTable.new(
+            name: "Next considered moves",
+            sorting_enabled: false,
+            keys: ~w[from index count to to_index score]a
+          )
         ]
         |> Kino.Layout.grid()
 
@@ -1088,8 +1118,23 @@ render_events = fn frame, button, solver_pid, recur ->
         [
           DisplayBoard.new(board),
           next_moves
+          |> Enum.map(fn {move, score} ->
+            %{
+              from: move.from.zone,
+              index: move.from.index,
+              count: move.from.count,
+              to: move.to.zone,
+              to_index: move.to.index,
+              score: score
+            }
+          end)
+          |> Kino.DataTable.new()
         ]
-        |> Kino.Layout.grid()
+        |> Kino.Layout.grid(
+          name: "Next considered moves",
+          sorting_enabled: false,
+          keys: ~w[from index count to to_index score]a
+        )
 
       Kino.Frame.render(frame, layout)
 
