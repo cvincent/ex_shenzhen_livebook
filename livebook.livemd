@@ -72,7 +72,7 @@ end
 
 ## Board
 
-This module defines the state of a game in the form of a `Board` struct. It also defines functions for modifying the game state with moves (either validated or not) and consolidating dragons (if possible).
+This module defines the state of a game in the form of a `Board` struct. It also defines functions for checking the win condition, modifying the game state with moves (either validated or not), and consolidating dragons (if possible).
 
 ```elixir
 defmodule Board do
@@ -117,13 +117,34 @@ defmodule Board do
     %Board{stacks: Enum.chunk_every(deck, 5) |> List.to_tuple()}
   end
 
+  def game_won?(board) do
+    free_slot_cards =
+      board.free_slots
+      |> Tuple.to_list()
+      |> Enum.concat()
+
+    stack_cards =
+      board.stacks
+      |> Tuple.to_list()
+      |> Enum.concat()
+
+    case {length(free_slot_cards), length(stack_cards), length(board.flower), length(board.black),
+          length(board.green), length(board.red)} do
+      {12, 0, 1, 9, 9, 9} ->
+        true
+
+      _ ->
+        false
+    end
+  end
+
   def move(board, move) do
     {board, cards} = take_from(board, move.from)
     put_to(board, move.to, cards)
   end
 
   def validate_and_move(board, move) do
-    if move.to in (Move.valid_locations_from(board, move.from) |> IO.inspect()) do
+    if move.to in Move.valid_locations_from(board, move.from) do
       move(board, move)
     else
       board
@@ -131,48 +152,25 @@ defmodule Board do
   end
 
   def consolidate_dragons(board, color) do
-    find_dragons = fn zone ->
-      Map.get(board, zone)
-      |> Tuple.to_list()
-      |> Enum.with_index()
-      |> Enum.filter(fn {stack, _i} -> length(stack) > 0 end)
-      |> Enum.map(fn {stack, i} -> {List.first(stack), zone, i} end)
-      |> Enum.filter(fn {card, _zone, _i} -> card.ordinal == :dragon and card.color == color end)
-    end
+    case Move.can_consolidate_dragons?(board, color) do
+      {visible_dragons, dest_slot} ->
+        {_, dest_slot} = dest_slot
 
-    visible_dragons =
-      Enum.concat(
-        find_dragons.(:free_slots),
-        find_dragons.(:stacks)
-      )
-      |> IO.inspect()
+        {_, board} =
+          Enum.map_reduce(visible_dragons, board, fn {_, zone, i}, acc ->
+            {
+              nil,
+              Board.move(acc, %{
+                from: %{zone: zone, index: i, count: 1},
+                to: %{zone: :free_slots, index: dest_slot, count: 0}
+              })
+            }
+          end)
 
-    dest_slot =
-      board.free_slots
-      |> Tuple.to_list()
-      |> Enum.with_index()
-      |> Enum.find(fn {stack, _i} ->
-        card = List.first(stack)
-        length(stack) == 0 or (card.ordinal == :dragon and card.color == color)
-      end)
+        board
 
-    if length(visible_dragons) == 4 and is_tuple(dest_slot) do
-      {_, dest_slot} = dest_slot
-
-      {_, board} =
-        Enum.map_reduce(visible_dragons, board, fn {_, zone, i}, acc ->
-          {
-            nil,
-            Board.move(acc, %{
-              from: %{zone: zone, index: i, count: 1},
-              to: %{zone: :free_slots, index: dest_slot, count: 0}
-            })
-          }
-        end)
-
-      board
-    else
-      board
+      false ->
+        board
     end
   end
 
@@ -293,6 +291,8 @@ end
 DisplayBoard.new(board)
 ```
 
+<!-- livebook:{"branch_parent_index":3} -->
+
 ## Test board
 
 Here we define a starting game manually for further testing, starting with a few unvalidated moves.
@@ -386,70 +386,99 @@ DisplayBoard.new(board)
 
 ## Move validation
 
-This module defines the real meat of the game logic. Given a location on the board, we can get back a list of every valid move from that location. We take this approach because it gives us a great starting point for writing a solver later.
-
-Consolidating dragons is currently handled in the `Board` module, since it consists of multiple moves and is either valid or not based on the entire game state. That said, it should probably be validated separately here, for easy use by the solver later.
+This module defines the real meat of the game logic. We can ask if dragons can be consolidated (which is probably always the best move to make whenever possible). And given a location on the board, we can get back a list of every valid move from that location. We take this approach because it gives us a great starting point for writing a solver later.
 
 ```elixir
 defmodule Move do
   @movable_from ~w[free_slots stacks]a
 
-  def valid_locations_from(board, %{zone: zone, count: 1} = location)
-      when zone in @movable_from do
-    empty_free_slot_moves =
+  def can_consolidate_dragons?(board, color) do
+    find_dragons = fn zone ->
+      Map.get(board, zone)
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.filter(fn {stack, _i} -> length(stack) > 0 end)
+      |> Enum.map(fn {stack, i} -> {List.first(stack), zone, i} end)
+      |> Enum.filter(fn {card, _zone, _i} -> card.ordinal == :dragon and card.color == color end)
+    end
+
+    visible_dragons =
+      Enum.concat(
+        find_dragons.(:free_slots),
+        find_dragons.(:stacks)
+      )
+
+    dest_slot =
       board.free_slots
       |> Tuple.to_list()
       |> Enum.with_index()
-      |> Enum.filter(fn {slot, _i} -> length(slot) == 0 end)
-      |> Enum.map(fn {_, i} -> %{zone: :free_slots, index: i, count: 0} end)
+      |> Enum.find(fn {stack, _i} ->
+        card = List.first(stack)
+        length(stack) == 0 or (card.ordinal == :dragon and card.color == color)
+      end)
 
+    if length(visible_dragons) == 4 and is_tuple(dest_slot) do
+      {visible_dragons, dest_slot}
+    else
+      false
+    end
+  end
+
+  def valid_locations_from(board, %{zone: zone, count: 1} = location)
+      when zone in @movable_from do
     card =
       Board.get_cards(board, location)
       |> List.first()
 
-    flower_move =
-      case card.ordinal do
-        :flower ->
-          [%{zone: :flower, index: 0, count: 0}]
+    if card do
+      if card.ordinal == :flower do
+        [%{zone: :flower, index: 0, count: 0}]
+      else
+        color_move =
+          case card && card.ordinal do
+            i when is_integer(i) ->
+              location = %{zone: card.color, index: 0, count: 0}
+              stack = Map.get(board, card.color)
 
-        _ ->
-          []
-      end
+              cond do
+                length(stack) == 0 and card.ordinal == 1 ->
+                  [location]
 
-    color_move =
-      case card.ordinal do
-        i when is_integer(i) ->
-          location = %{zone: card.color, index: 0, count: 0}
-          stack = Map.get(board, card.color)
+                length(stack) > 0 and List.first(stack).ordinal == card.ordinal - 1 ->
+                  [location]
 
-          cond do
-            length(stack) == 0 and card.ordinal == 1 ->
-              [location]
+                true ->
+                  []
+              end
 
-            length(stack) > 0 and List.first(stack).ordinal == card.ordinal - 1 ->
-              [location]
-
-            true ->
+            _ ->
               []
           end
 
-        _ ->
-          []
+        empty_free_slot_moves =
+          board.free_slots
+          |> Tuple.to_list()
+          |> Enum.with_index()
+          |> Enum.filter(fn {slot, _i} -> length(slot) == 0 end)
+          |> Enum.map(fn {_, i} -> %{zone: :free_slots, index: i, count: 0} end)
+
+        stack_moves =
+          board.stacks
+          |> Tuple.to_list()
+          |> Enum.with_index()
+          |> Enum.map(fn {_stack, i} -> %{zone: :stacks, index: i, count: 0} end)
+          |> Enum.filter(fn location -> can_stack?(board, location, [card]) end)
+
+        Enum.concat([
+          color_move,
+          empty_free_slot_moves,
+          stack_moves
+        ])
+        |> Enum.reject(&(&1.zone == location.zone and &1.index == location.index))
       end
-
-    stack_moves =
-      board.stacks
-      |> Tuple.to_list()
-      |> Enum.with_index()
-      |> Enum.map(fn {_stack, i} -> %{zone: :stacks, index: i, count: 0} end)
-      |> Enum.filter(fn location -> can_stack?(board, location, [card]) end)
-
-    Enum.concat([
-      empty_free_slot_moves,
-      flower_move,
-      color_move,
-      stack_moves
-    ])
+    else
+      []
+    end
   end
 
   def valid_locations_from(board, %{zone: zone} = location) when zone in @movable_from do
@@ -490,7 +519,8 @@ defmodule Move do
       |> List.first()
 
     with true <- valid_sequence?(cards),
-         true <- valid_sequence?(Enum.concat(cards, [stack_bottom_card])) do
+         true <-
+           valid_sequence?(Enum.concat(cards, [stack_bottom_card]) |> Enum.reject(&is_nil/1)) do
       true
     else
       _ ->
@@ -503,6 +533,8 @@ defmodule Move do
   end
 end
 ```
+
+<!-- livebook:{"branch_parent_index":5} -->
 
 ## More testing
 
@@ -614,4 +646,474 @@ DisplayBoard.new(board)
 ```elixir
 board = Board.consolidate_dragons(board, :red)
 DisplayBoard.new(board)
+```
+
+## Solver
+
+This solver does a depth-first search for the win condition. It applies a simple best-first heuristic to possible moves at each depth with a simple, tweakable scoring algorithm. Moves which move more cards into their final win positions or which expose cards that can then be moved into their win positions are preferred. Moves which expose more distinct dragon colors are somewhat penalized. Moves which expose the fourth dragon of a given color, meaning they can be consolidated in the next move, are greatly favored.
+
+To prevent looping and redundant searching, previously seen game states are saved to an ETS table. Moves which would enter one of these known states are discarded.
+
+The solver returns the first winning sequence of moves that it finds. It does not attempt to find the *shortest* sequence. This could be improved by doing an exhaustive search and then returning the shortest solution, however in my testing I have found that this may be unfeasible, as games with long solutions have seen hundreds of thousands of distinct game states by the time they found *a* solution.
+
+An improvement definitely worth looking into would be to modify the A* algorithm to this search space; with the correct heuristic, A* should find the shortest possible solution in far less time. It could be improved another step by using OTP to parallelize the search.
+
+Behavior when given an invalid board state (e.g., a board with 5 red dragons instead of 4) is undefined. Attempt at your own risk.
+
+The solver may be started with `wait_each_step` set to `true`. This can be used to interactively step through and view the solver state, as demonstrated below.
+
+```elixir
+defmodule Solver do
+  @known_states :known_states
+
+  def solve(board, wait_each_step \\ false) do
+    try do
+      :ets.delete(@known_states)
+    rescue
+      _ ->
+        nil
+    end
+
+    :ets.new(@known_states, [:set, :public, :named_table])
+    attempt_solution_from_board_state(board, wait_each_step, [])
+  end
+
+  def attempt_solution_from_board_state(board, wait_each_step, previous_moves) do
+    next_moves =
+      board
+      |> possible_moves()
+      |> Enum.map(fn move ->
+        to_board = board_state_after_move(board, move)
+        {move, to_board, :ets.update_counter(@known_states, to_board, 1, {0, 0})}
+      end)
+      |> Enum.reject(fn {_, _, known_states_count} -> known_states_count > 1 end)
+      |> Enum.uniq_by(&elem(&1, 1))
+      |> Enum.map(fn {move, to_board, _} -> {move, to_board, game_score(board, to_board)} end)
+      |> Enum.sort_by(fn {_, _, score} -> score end, :desc)
+
+    if wait_each_step do
+      receive do
+        {:next, from_pid} ->
+          send(
+            from_pid,
+            {
+              :new_board,
+              board,
+              previous_moves,
+              Enum.map(next_moves, fn {move, _, score} -> {move, score} end)
+            }
+          )
+      end
+    end
+
+    if winning_move = Enum.find(next_moves, fn {_, to_board, _} -> Board.game_won?(to_board) end) do
+      result = {
+        :won,
+        [winning_move | previous_moves]
+        |> Enum.map(fn {move, _, _} -> move end)
+      }
+
+      if wait_each_step do
+        {_, win_state} = winning_move
+
+        receive do
+          {:next, from_pid} ->
+            send(from_pid, {result, win_state})
+        end
+      end
+
+      result
+    else
+      next_moves
+      |> Enum.find_value(fn {_, to_board, _} = next_move ->
+        case attempt_solution_from_board_state(to_board, wait_each_step, [
+               next_move | previous_moves
+             ]) do
+          {:won, _} = result ->
+            result
+
+          _ ->
+            false
+        end
+      end)
+    end
+  end
+
+  def possible_moves(board) do
+    dragon_consolidation_moves =
+      [:black, :green, :red]
+      |> Enum.filter(&Move.can_consolidate_dragons?(board, &1))
+      |> Enum.map(&{:consolidate_dragons, &1})
+
+    free_slot_moves =
+      board.free_slots
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.reject(fn {stack, _} -> length(stack) == 4 end)
+      |> Enum.map(fn {_, i} -> %{zone: :free_slots, index: i, count: 1} end)
+      |> Enum.map(fn from ->
+        Move.valid_locations_from(board, from)
+        |> Enum.reject(&(&1.zone == :free_slots))
+        |> Enum.map(&%{from: from, to: &1})
+      end)
+      |> Enum.concat()
+
+    stack_moves =
+      board.stacks
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.reject(fn {stack, _} -> length(stack) == 0 end)
+      |> Enum.map(fn {stack, i} ->
+        1..length(stack)
+        |> Enum.map(fn count ->
+          %{zone: :stacks, index: i, count: count}
+        end)
+      end)
+      |> Enum.concat()
+      |> Enum.map(fn from ->
+        to_moves = Move.valid_locations_from(board, from)
+        first_free_slot_move = Enum.find(to_moves, &(&1.zone == :free_slots))
+
+        to_moves
+        |> Enum.reject(&(&1.zone == :free_slots))
+        |> Enum.concat([first_free_slot_move])
+        |> Enum.reject(&is_nil/1)
+        |> Enum.map(&%{from: from, to: &1})
+      end)
+      |> Enum.concat()
+      |> Enum.reject(fn %{from: from, to: to} ->
+        to.zone == :stacks and
+          from.count == length(Board.get_stack(board, from)) and
+          length(Board.get_stack(board, to)) == 0
+      end)
+
+    [
+      dragon_consolidation_moves,
+      free_slot_moves,
+      stack_moves
+    ]
+    |> Enum.concat()
+
+    # |> Enum.sort_by(fn
+    # {:consolidate_dragons, _} -> 0
+    # %{to: %{zone: :flower}} -> 1
+    # %{to: %{zone: zone}} when zone in [:black, :green, :red] -> 2
+    # %{from: %{zone: :free_slots}} -> 3
+    # %{from: %{zone: :stacks}, to: %{zone: :stacks}} -> 4
+    # %{to: %{zone: :free_slots}} -> 5
+    # _ -> 6
+    # end)
+  end
+
+  def board_state_after_move(board, {:consolidate_dragons, color}) do
+    Board.consolidate_dragons(board, color)
+  end
+
+  def board_state_after_move(board, move) do
+    Board.move(board, move)
+  end
+
+  def normalize_state(board) do
+    %Board{
+      free_slots: sort_stacks(board.free_slots),
+      flower: board.flower,
+      black: board.black,
+      green: board.green,
+      red: board.red,
+      stacks: sort_stacks(board.stacks)
+    }
+  end
+
+  defp sort_stacks(stacks) do
+    stacks
+    |> Tuple.to_list()
+    |> Enum.sort_by(fn stack ->
+      Enum.map(stack, &"#{&1.color}#{&1.ordinal}")
+      |> Enum.join(";")
+    end)
+    |> List.to_tuple()
+  end
+
+  def game_score(from_board, to_board) do
+    from_empty_free_slots = empty_count(from_board.free_slots)
+    to_empty_free_slots = empty_count(to_board.free_slots)
+    delta_empty_free_slots = to_empty_free_slots - from_empty_free_slots
+
+    from_empty_stack_slots = empty_count(from_board.stacks)
+    to_empty_stack_slots = empty_count(to_board.stacks)
+    delta_empty_stack_slots = to_empty_stack_slots - from_empty_stack_slots
+
+    delta_win_position_cards =
+      [
+        length(to_board.flower) - length(from_board.flower),
+        length(to_board.black) - length(from_board.black),
+        length(to_board.green) - length(from_board.green),
+        length(to_board.red) - length(from_board.red)
+      ]
+      |> Enum.sum()
+
+    next_needed =
+      [:black, :green, :red]
+      |> Enum.map(fn color ->
+        case Map.get(from_board, color) |> List.first() do
+          nil -> %Card{color: color, ordinal: 1}
+          card -> %Card{color: color, ordinal: card.ordinal + 1}
+        end
+      end)
+      |> Enum.concat([%Card{color: nil, ordinal: :flower}])
+
+    from_exposed_cards = exposed_cards(from_board)
+    to_exposed_cards = exposed_cards(to_board)
+
+    from_exposed_next_needed =
+      from_exposed_cards
+      |> Enum.count(&(&1 in next_needed))
+
+    to_exposed_next_needed =
+      to_exposed_cards
+      |> Enum.count(&(&1 in next_needed))
+
+    delta_exposed_next_needed = to_exposed_next_needed - from_exposed_next_needed
+
+    from_exposed_dragon_colors = dragon_colors(from_exposed_cards)
+    to_exposed_dragon_colors = dragon_colors(to_exposed_cards)
+    delta_exposed_dragon_colors = to_exposed_dragon_colors - from_exposed_dragon_colors
+
+    delta_can_consolidate =
+      not Enum.any?([:black, :green, :red], &Move.can_consolidate_dragons?(from_board, &1)) and
+        Enum.any?([:black, :green, :red], &Move.can_consolidate_dragons?(to_board, &1))
+
+    # delta_empty_free_slots +
+    # delta_empty_stack_slots +
+    score =
+      delta_win_position_cards * 4 +
+        delta_exposed_next_needed * 2 -
+        delta_exposed_dragon_colors
+
+    case delta_can_consolidate do
+      true -> score * 2
+      false -> score
+    end
+
+    # cond do
+    #  Enum.any?([:black, :green, :red], &Move.can_consolidate_dragons?(to_board, &1)) ->
+    #    score + 100
+    #  Enum.any?(exposed_cards, fn card -> card in next_needed end) ->
+    #    score + 100
+    #  true ->
+    #    score
+    # end
+  end
+
+  defp empty_count(stacks) do
+    stacks
+    |> Tuple.to_list()
+    |> Enum.count(&(length(&1) == 0))
+  end
+
+  defp exposed_cards(board) do
+    board.stacks
+    |> Tuple.to_list()
+    |> Enum.map(&List.first/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp dragon_colors(cards) do
+    cards
+    |> Enum.filter(&(&1.ordinal == :dragon))
+    |> Enum.map(& &1.color)
+    |> Enum.uniq()
+    |> length()
+  end
+end
+```
+
+## Solver test board
+
+Here we can set up a board to test the solver against.
+
+```elixir
+board = %Board{
+  free_slots: {
+    1..4 |> Enum.map(fn _ -> %Card{color: :black, ordinal: :dragon} end),
+    1..4 |> Enum.map(fn _ -> %Card{color: :green, ordinal: :dragon} end),
+    []
+  },
+  flower: [%Card{color: nil, ordinal: :flower}],
+  black: 1..9 |> Enum.map(fn i -> %Card{color: :black, ordinal: i} end) |> Enum.reverse(),
+  green: 1..9 |> Enum.map(fn i -> %Card{color: :green, ordinal: i} end) |> Enum.reverse(),
+  red: 1..7 |> Enum.map(fn i -> %Card{color: :red, ordinal: i} end) |> Enum.reverse(),
+  stacks: {
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    1..4 |> Enum.map(fn _ -> %Card{color: :red, ordinal: :dragon} end),
+    [
+      %Card{color: :red, ordinal: 9},
+      %Card{color: :red, ordinal: 8}
+    ]
+  }
+}
+
+board = %Board{
+  free_slots: {
+    [%Card{color: :red, ordinal: :dragon}],
+    [
+      %Card{color: :green, ordinal: :dragon},
+      %Card{color: :green, ordinal: :dragon},
+      %Card{color: :green, ordinal: :dragon},
+      %Card{color: :green, ordinal: :dragon}
+    ],
+    [%Card{color: :black, ordinal: 9}]
+  },
+  flower: [%Card{color: nil, ordinal: :flower}],
+  black: [%Card{color: :black, ordinal: 1}],
+  green: [
+    %Card{color: :green, ordinal: 3},
+    %Card{color: :green, ordinal: 2},
+    %Card{color: :green, ordinal: 1}
+  ],
+  red: [%Card{color: :red, ordinal: 1}],
+  stacks: {
+    [
+      %Card{color: :black, ordinal: :dragon}
+    ],
+    [
+      %Card{color: :red, ordinal: 9},
+      %Card{color: :green, ordinal: 7},
+      %Card{color: :green, ordinal: 6}
+    ],
+    [
+      %Card{color: :red, ordinal: :dragon},
+      %Card{color: :green, ordinal: 9},
+      %Card{color: :red, ordinal: 4},
+      %Card{color: :black, ordinal: 8}
+    ],
+    [
+      %Card{color: :black, ordinal: 3},
+      %Card{color: :green, ordinal: 4},
+      %Card{color: :red, ordinal: 5},
+      %Card{color: :black, ordinal: 6},
+      %Card{color: :red, ordinal: 7}
+    ],
+    [
+      %Card{color: :red, ordinal: 3},
+      %Card{color: :black, ordinal: 4},
+      %Card{color: :green, ordinal: 5},
+      %Card{color: :red, ordinal: 6},
+      %Card{color: :black, ordinal: 7},
+      %Card{color: :red, ordinal: 8}
+    ],
+    [
+      %Card{color: :black, ordinal: 5},
+      %Card{color: :red, ordinal: :dragon}
+    ],
+    [
+      %Card{color: :black, ordinal: :dragon},
+      %Card{color: :black, ordinal: :dragon},
+      %Card{color: :green, ordinal: 8},
+      %Card{color: :red, ordinal: 2}
+    ],
+    [
+      %Card{color: :red, ordinal: :dragon},
+      %Card{color: :black, ordinal: :dragon},
+      %Card{color: :black, ordinal: 2}
+    ]
+  }
+}
+
+board = Board.new_game()
+
+DisplayBoard.new(board)
+```
+
+<!-- livebook:{"branch_parent_index":8} -->
+
+## Test solver
+
+Now we test the solver by simply passing the test board into it.
+
+```elixir
+case Solver.solve(board) do
+  {:won, moves} ->
+    Enum.each(moves, &IO.inspect/1)
+    IO.inspect(Enum.count(moves))
+
+  _ ->
+    "No solution."
+end
+```
+
+```elixir
+:ets.select_count(:known_states, :ets.fun2ms(fn _ -> true end))
+```
+
+<!-- livebook:{"branch_parent_index":8} -->
+
+## Test solver visually
+
+Here's an example of using the solver interactively. First, we set up a `Kino.Frame` and a Next button.
+
+```elixir
+frame = Kino.Frame.new()
+button = Kino.Control.button("Next")
+Kino.Frame.render(frame, "Ready.")
+Kino.Layout.grid([button, frame])
+```
+
+Now we start the solver with `wait_each_step` in a separate process, then start awaiting clicks on the Next button. Each time the button is clicked, we send a message to the solver process telling it to advance a step, and it replies with a message with its current state. We then render this state in the `Kino.Frame` we created above.
+
+```elixir
+render_events = fn frame, button, solver_pid, recur ->
+  Enum.take(Kino.Control.stream(button), 1)
+  send(solver_pid, {:next, self()})
+
+  receive do
+    {:new_board, board, previous_moves, next_moves} ->
+      layout =
+        [
+          previous_moves |> Enum.map(fn {move, _, _} -> move end),
+          DisplayBoard.new(board),
+          next_moves
+        ]
+        |> Kino.Layout.grid()
+
+      Kino.Frame.render(frame, layout)
+
+    {:new_board, board, nil, next_moves} ->
+      layout =
+        [
+          DisplayBoard.new(board),
+          next_moves
+        ]
+        |> Kino.Layout.grid()
+
+      Kino.Frame.render(frame, layout)
+
+    {{:won, moves}, board} ->
+      layout =
+        [
+          "Solution found in #{length(moves)} moves!",
+          moves,
+          DisplayBoard.new(board)
+        ]
+        |> Kino.Layout.grid()
+
+      Kino.Frame.render(frame, layout)
+  end
+
+  recur.(frame, button, solver_pid, recur)
+end
+
+solver_pid =
+  spawn(fn ->
+    Solver.solve(board, true)
+  end)
+
+spawn(fn ->
+  render_events.(frame, button, solver_pid, render_events)
+end)
 ```
